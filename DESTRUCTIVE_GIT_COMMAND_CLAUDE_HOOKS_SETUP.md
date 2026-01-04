@@ -1,179 +1,79 @@
 # Destructive Git Command Protection for Claude Code
 
-## Why This Exists
+## Overview
 
-On December 17, 2025, an AI agent (Claude) ran `git checkout --` on multiple files containing hours of uncommitted work from another agent (Codex). This destroyed the work instantly and silently. The files were eventually recovered from a dangling Git object, but this incident revealed a critical gap: **AI agents can execute destructive commands without understanding the consequences**.
+This documentation describes a safety system that prevents AI agents from executing dangerous Git and filesystem commands. The setup includes a Python guard script and Claude Code hook configuration with **two-tier protection**:
 
-The `AGENTS.md` file already forbade such commands, but instructions alone don't prevent execution. This hook provides **mechanical enforcement** - the command is blocked before it can run.
+- **DANGEROUS** patterns are **blocked completely** (catastrophic operations)
+- **RISKY** patterns **prompt the user** for confirmation (dangerous but sometimes needed)
 
-## What Was Created
+## Key Components
 
-Two files in the Ultimate Bug Scanner project:
+**The Problem**: AI agents can execute `git checkout --`, `git reset --hard`, or `rm -rf` on files, permanently erasing uncommitted changes. While instructions may forbid this, mechanical enforcement is needed.
 
-```
-ultimate_bug_scanner/
-├── .claude/
-│   ├── settings.json          # Hook configuration
-│   └── hooks/
-│       └── git_safety_guard.py  # The guard script
-```
+**The Solution**: A PreToolUse hook that intercepts Bash commands before execution:
+- Blocks catastrophic operations with explanatory feedback
+- Prompts user confirmation for risky operations
 
-## How It Works
+## Two-Tier Protection
 
-### Claude Code Hooks System
+### DANGEROUS (Blocked Completely)
 
-Claude Code has a hooks system that can intercept tool calls at various lifecycle points:
-
-- **PreToolUse** - Runs before a tool executes (can block)
-- **PostToolUse** - Runs after a tool completes
-- **Notification** - Runs on status changes
-
-The `PreToolUse` hook receives the full tool input as JSON via stdin and can:
-1. **Allow** the command (exit 0, no output)
-2. **Block** the command (exit 0 with JSON containing `permissionDecision: "deny"`)
-3. **Ask the user** (exit 0 with JSON containing `permissionDecision: "ask"`)
-
-### The Guard Script
-
-`git_safety_guard.py` is a Python script that:
-
-1. Receives the command about to be executed via JSON stdin
-2. Checks if it matches any dangerous patterns
-3. Returns a deny decision with explanation if blocked
-4. Silently allows safe commands
-
-### Configuration
-
-`.claude/settings.json` tells Claude Code to run the guard on all Bash commands:
-
-```json
-{
-  "hooks": {
-    "PreToolUse": [
-      {
-        "matcher": "Bash",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/git_safety_guard.py"
-          }
-        ]
-      }
-    ]
-  }
-}
-```
-
-## Commands Blocked
-
-| Command Pattern | Why It's Dangerous |
-|-----------------|-------------------|
-| `git checkout -- <files>` | Discards uncommitted changes permanently |
-| `git restore <files>` | Same as checkout -- (newer syntax) |
-| `git reset --hard` | Destroys all uncommitted changes |
+| Pattern | Reason |
+|---------|--------|
+| `rm -rf /` or `rm -rf ~` | Catastrophic filesystem destruction |
+| `git push --force main/master` | Destroys shared remote history |
+| `git stash clear` | Permanently deletes ALL stashes |
+| `git restore <path>` | Discards uncommitted changes |
+| `git restore --worktree` | Discards uncommitted changes |
+| `git reset --hard` | Destroys uncommitted changes |
 | `git reset --merge` | Can lose uncommitted changes |
 | `git clean -f` | Removes untracked files permanently |
-| `git push --force` | Destroys remote history |
-| `git push -f` | Same as --force |
-| `git branch -D` | Force-deletes branch without merge check |
-| `rm -rf` (non-temp paths) | Recursive file deletion (except `/tmp`, `/var/tmp`, `$TMPDIR`) |
-| `git stash drop` | Permanently deletes stashed changes |
-| `git stash clear` | Deletes ALL stashed changes |
 
-## Commands Explicitly Allowed
+### RISKY (Prompts User)
 
-These patterns are allowlisted even if they partially match blocked patterns:
+| Pattern | Reason |
+|---------|--------|
+| `git checkout -- <path>` | Discards uncommitted changes |
+| `git checkout <path>` (old-style) | Discards uncommitted changes |
+| `git push --force` (non-main) | Can destroy remote history |
+| `git push -f` | Can destroy remote history |
+| `git branch -D` | Force-deletes without merge check |
+| `rm -rf <dir>` | Recursive forced delete |
+| `rm <file>` | Deletes source files |
+| `git stash drop` | Deletes single stash |
+| `> file.rs` | Truncates file to zero bytes |
+| `: > file` | Truncates file to zero bytes |
+| `truncate <file>` | Truncates file |
+| `mv -f <src> <dest>` | Overwrites without backup |
 
-| Command Pattern | Why It's Safe |
-|-----------------|---------------|
-| `git checkout -b <branch>` | Creates new branch, doesn't modify files |
-| `git checkout --orphan` | Creates orphan branch |
-| `git restore --staged` | Only unstages files, doesn't discard changes |
-| `git clean -n` / `--dry-run` | Preview only, no actual deletion |
-| `rm -rf /tmp/...` | Temp directories are designed for ephemeral data |
-| `rm -rf /var/tmp/...` | System temp directory, safe to clean |
-| `rm -rf $TMPDIR/...` | User's temp directory, safe to clean |
+### Safe Allowlist (Always Allowed)
 
-## What Happens When Blocked
+- `git checkout -b` (creates branches)
+- `git checkout --orphan` (orphan branches)
+- `git restore --staged` (unstaging only)
+- `git clean -n` / `git clean --dry-run` (dry-run preview)
+- `rm -rf` targeting `/tmp/`, `/var/tmp/`, or `$TMPDIR`
 
-When Claude tries to run a blocked command, it receives feedback like:
+## Installation
 
-```
-BLOCKED by git_safety_guard.py
-
-Reason: git checkout -- discards uncommitted changes permanently. Use 'git stash' first.
-
-Command: git checkout -- file.txt
-
-If this operation is truly needed, ask the user for explicit permission and have them run the command manually.
-```
-
-The command never executes. Claude sees this feedback and should ask the user for help.
-
-## Testing the Hook
-
-You can test the hook manually:
-
-```bash
-# Should be blocked
-echo '{"tool_name": "Bash", "tool_input": {"command": "git checkout -- file.txt"}}' | \
-  python3 .claude/hooks/git_safety_guard.py
-
-# Should be allowed (no output)
-echo '{"tool_name": "Bash", "tool_input": {"command": "git status"}}' | \
-  python3 .claude/hooks/git_safety_guard.py
-
-# rm -rf on non-temp path should be blocked
-echo '{"tool_name": "Bash", "tool_input": {"command": "rm -rf /some/path"}}' | \
-  python3 .claude/hooks/git_safety_guard.py
-
-# rm -rf on temp path should be allowed (no output)
-echo '{"tool_name": "Bash", "tool_input": {"command": "rm -rf /tmp/test-dir"}}' | \
-  python3 .claude/hooks/git_safety_guard.py
-```
-
-## Important Notes
-
-### Restart Required
-
-Claude Code snapshots hook configuration at startup. After adding or modifying hooks, you must **restart Claude Code** for changes to take effect.
-
-### Project-Specific
-
-This hook is configured in `.claude/settings.json` within the project directory, so it only applies to sessions in that project. For global protection across all projects, add the hook to `~/.claude/settings.json` instead.
-
-### Not Foolproof
-
-The hook uses regex pattern matching. Clever or obfuscated commands might bypass it. It's a safety net, not a security boundary. The real defense is still the instructions in `AGENTS.md` - this hook just catches honest mistakes.
-
-### Timeout
-
-Hooks have a 60-second timeout by default. The guard script runs in milliseconds, so this isn't a concern.
-
-## Automated Setup Script
-
-Save this script and run it to install the protection. Supports both project-local and global installation.
+### Automated Setup Script
 
 ```bash
 #!/usr/bin/env bash
-#
 # install-claude-git-guard.sh
-# Installs Claude Code hook to block destructive git/filesystem commands
-#
-# Usage:
-#   ./install-claude-git-guard.sh          # Install in current project (.claude/)
-#   ./install-claude-git-guard.sh --global # Install globally (~/.claude/)
-#
+# Installs two-tier protection hooks for Claude Code
+
 set -euo pipefail
 
-# Colors for output
+# Color output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
-NC='\033[0m' # No Color
+NC='\033[0m'
 
-# Determine installation location
+# Determine location
 if [[ "${1:-}" == "--global" ]]; then
     INSTALL_DIR="$HOME/.claude"
     HOOK_PATH="\$HOME/.claude/hooks/git_safety_guard.py"
@@ -186,104 +86,146 @@ else
     echo -e "${BLUE}Installing to current project (.claude/)${NC}"
 fi
 
-# Create directories
 mkdir -p "$INSTALL_DIR/hooks"
 
-# Write the guard script
-cat > "$INSTALL_DIR/hooks/git_safety_guard.py" << 'PYTHON_SCRIPT'
+# Create the guard script
+cat > "$INSTALL_DIR/hooks/git_safety_guard.py" << 'GUARD_SCRIPT'
 #!/usr/bin/env python3
 """
 Git/filesystem safety guard for Claude Code.
 
-Blocks destructive commands that can lose uncommitted work or delete files.
-This hook runs before Bash commands execute and can deny dangerous operations.
+Protects against destructive commands that can lose uncommitted work or delete files.
+This hook runs before Bash commands execute.
 
-Exit behavior:
-  - Exit 0 with JSON {"hookSpecificOutput": {"permissionDecision": "deny", ...}} = block
-  - Exit 0 with no output = allow
+Permission decisions:
+  - "deny"  = Block completely (truly dangerous, catastrophic)
+  - "ask"   = Prompt user for confirmation (risky but sometimes needed)
+  - (no output) = Allow
 """
 import json
 import re
 import sys
 
-# Destructive patterns to block - tuple of (regex, reason)
-DESTRUCTIVE_PATTERNS = [
-    # Git commands that discard uncommitted changes
+# DANGEROUS: Block completely - catastrophic or affects shared resources
+DANGEROUS_PATTERNS = [
+    # Catastrophic filesystem operations
     (
-        r"git\s+checkout\s+--\s+",
-        "git checkout -- discards uncommitted changes permanently. Use 'git stash' first."
+        r"rm\s+-[a-z]*r[a-z]*f[a-z]*\s+[/~]\s*$",
+        "rm -rf on root or home is catastrophic."
     ),
     (
-        r"git\s+checkout\s+(?!-b\b)(?!--orphan\b)[^\s]+\s+--\s+",
-        "git checkout <ref> -- <path> overwrites working tree. Use 'git stash' first."
+        r"rm\s+-[a-z]*r[a-z]*f[a-z]*\s+~/\s*$",
+        "rm -rf on home directory is catastrophic."
+    ),
+    # Force push to main/master - affects shared history
+    (
+        r"git\s+push\s+.*--force(?!-with-lease).*\s+(main|master)\b",
+        "Force push to main/master destroys shared history."
     ),
     (
-        r"git\s+restore\s+(?!--staged\b)(?!-S\b)",
-        "git restore discards uncommitted changes. Use 'git stash' or 'git diff' first."
+        r"git\s+push\s+-f\b.*\s+(main|master)\b",
+        "Force push to main/master destroys shared history."
+    ),
+    # Clear all stashes - no recovery
+    (
+        r"git\s+stash\s+clear",
+        "git stash clear permanently deletes ALL stashed changes."
+    ),
+    # Git restore - discards uncommitted changes
+    (
+        r"git\s+restore\s+(?!--staged\b)[^\s]*\s*$",
+        "git restore discards uncommitted changes."
     ),
     (
-        r"git\s+restore\s+.*(?:--worktree|-W\b)",
-        "git restore --worktree/-W discards uncommitted changes permanently."
+        r"git\s+restore\s+--worktree",
+        "git restore --worktree discards uncommitted changes."
     ),
-    # Git reset variants
+    # Git reset variants - destroys uncommitted changes
     (
         r"git\s+reset\s+--hard",
-        "git reset --hard destroys uncommitted changes. Use 'git stash' first."
+        "git reset --hard destroys uncommitted changes."
     ),
     (
         r"git\s+reset\s+--merge",
         "git reset --merge can lose uncommitted changes."
     ),
-    # Git clean
+    # Git clean - removes untracked files
     (
         r"git\s+clean\s+-[a-z]*f",
-        "git clean -f removes untracked files permanently. Review with 'git clean -n' first."
+        "git clean -f removes untracked files permanently."
     ),
-    # Force operations
-    # Note: (?![-a-z]) ensures we only block bare --force, not --force-with-lease or --force-if-includes
+]
+
+# RISKY: Prompt user - dangerous but sometimes needed
+RISKY_PATTERNS = [
+    # Git checkout variants that discard changes
     (
-        r"git\s+push\s+.*--force(?![-a-z])",
-        "Force push can destroy remote history. Use --force-with-lease if necessary."
+        r"git\s+checkout\s+--\s+",
+        "This discards uncommitted changes. Continue?"
     ),
     (
-        r"git\s+push\s+.*-f\b",
-        "Force push (-f) can destroy remote history. Use --force-with-lease if necessary."
+        r"git\s+checkout\s+(?!-b\b)(?!--orphan\b)[^\s]+\s+--\s+",
+        "This overwrites working tree files. Continue?"
     ),
+    # git checkout <path> without -- (old-style syntax)
+    (
+        r"git\s+checkout\s+(?!-)[^\s]*[/][^\s]*\.[a-zA-Z]+\s*(?:2>|$|&&|\|\|)",
+        "This discards uncommitted changes. Continue?"
+    ),
+    (
+        r"git\s+checkout\s+(?!-)[^\s]+\.(rs|ts|js|vue|py|lua|json|toml|md|txt|yaml|yml|sh|css|html)\s*(?:2>|$|&&|\|\|)",
+        "This discards uncommitted changes. Continue?"
+    ),
+    # Force push (not to main/master - those are blocked above)
+    (
+        r"git\s+push\s+.*--force(?!-with-lease)",
+        "Force push can destroy remote history. Continue?"
+    ),
+    (
+        r"git\s+push\s+-f\b",
+        "Force push can destroy remote history. Continue?"
+    ),
+    # Branch force delete
     (
         r"git\s+branch\s+-D\b",
-        "git branch -D force-deletes without merge check. Use -d for safety."
+        "git branch -D force-deletes without merge check. Continue?"
     ),
-    # Destructive filesystem commands
-    # Note: [rR] because both -r and -R mean recursive in GNU coreutils
-    # Note: [a-zA-Z] to handle any flag combinations
-    # Note: Specific root/home pattern MUST come before generic pattern for correct error message
-    # Note: Also catch separate flags (-r -f) and long options (--recursive --force)
+    # rm -rf (general, not root/home - those are blocked above)
     (
-        r"rm\s+-[a-zA-Z]*[rR][a-zA-Z]*f[a-zA-Z]*\s+[/~]|rm\s+-[a-zA-Z]*f[a-zA-Z]*[rR][a-zA-Z]*\s+[/~]",
-        "rm -rf on root or home paths is EXTREMELY DANGEROUS. This command will NOT be executed. Ask the user to run it manually if truly needed."
+        r"rm\s+-[a-z]*r[a-z]*f|rm\s+-[a-z]*f[a-z]*r",
+        "rm -rf is destructive. Continue?"
     ),
-    (
-        r"rm\s+-[a-zA-Z]*[rR][a-zA-Z]*f|rm\s+-[a-zA-Z]*f[a-zA-Z]*[rR]",
-        "rm -rf is destructive and requires human approval. Explain what you want to delete and why, then ask the user to run the command manually."
-    ),
-    # Catch rm with separate -r and -f flags (e.g., rm -r -f, rm -f -r, rm -r -i -f)
-    (
-        r"rm\s+(-[a-zA-Z]+\s+)*-[rR]\s+(-[a-zA-Z]+\s+)*-f|rm\s+(-[a-zA-Z]+\s+)*-f\s+(-[a-zA-Z]+\s+)*-[rR]",
-        "rm with separate -r -f flags is destructive and requires human approval."
-    ),
-    # Catch rm with long options (--recursive, --force)
-    (
-        r"rm\s+.*--recursive.*--force|rm\s+.*--force.*--recursive",
-        "rm --recursive --force is destructive and requires human approval."
-    ),
-    # Git stash drop/clear without explicit permission
+    # Git stash drop (single stash)
     (
         r"git\s+stash\s+drop",
-        "git stash drop permanently deletes stashed changes. List stashes first."
+        "git stash drop permanently deletes stashed changes. Continue?"
+    ),
+    # Plain rm on source files
+    (
+        r"rm\s+(?!-)[^\s]*\.(rs|ts|js|vue|py|lua|json|toml|md|txt|yaml|yml|sh|css|html)\b",
+        "This deletes a source file. Continue?"
     ),
     (
-        r"git\s+stash\s+clear",
-        "git stash clear permanently deletes ALL stashed changes."
+        r"rm\s+(?!-)[^\s]*[/][^\s]*\.[a-zA-Z]+\s*(?:2>|$|&&|\|\||;)",
+        "This deletes a file. Continue?"
+    ),
+    # File truncation (silent and destructive)
+    (
+        r"(?:^|&&|\|\||;)\s*>\s*[^\s]+\.(rs|ts|js|vue|py|lua|json|toml|md|txt|yaml|yml|sh|css|html)\b",
+        "This truncates a file to zero bytes. Continue?"
+    ),
+    (
+        r":\s*>\s*[^\s]+\.[a-zA-Z]+",
+        "This truncates a file to zero bytes. Continue?"
+    ),
+    (
+        r"truncate\s+(-s\s*0\s+)?[^\s]+\.[a-zA-Z]+",
+        "This truncates a file. Continue?"
+    ),
+    # Overwrite without backup (mv -f)
+    (
+        r"mv\s+-[a-z]*f[a-z]*\s+[^\s]+\s+[^\s]+\.(rs|ts|js|vue|py|lua|json|toml|md|txt|yaml|yml|sh|css|html)\b",
+        "This overwrites a file without backup. Continue?"
     ),
 ]
 
@@ -291,78 +233,64 @@ DESTRUCTIVE_PATTERNS = [
 SAFE_PATTERNS = [
     r"git\s+checkout\s+-b\s+",           # Creating new branch
     r"git\s+checkout\s+--orphan\s+",     # Creating orphan branch
-    # Unstaging is safe, BUT NOT if --worktree/-W is also present (that modifies working tree)
-    r"git\s+restore\s+--staged\s+(?!.*--worktree)(?!.*-W\b)",  # Unstaging only (safe)
-    r"git\s+restore\s+-S\s+(?!.*--worktree)(?!.*-W\b)",        # Unstaging short form (safe)
+    r"git\s+restore\s+--staged\s+",      # Unstaging (safe)
     r"git\s+clean\s+-n",                 # Dry run
     r"git\s+clean\s+--dry-run",          # Dry run
-    # Allow rm -rf on temp directories (designed for ephemeral data)
-    # Note: [rR] because both -r and -R mean recursive
-    # Note: Must handle BOTH flag orderings: -rf/-Rf AND -fr/-fR
-    r"rm\s+-[a-zA-Z]*[rR][a-zA-Z]*f[a-zA-Z]*\s+/tmp/",        # /tmp/... (-rf, -Rf style)
-    r"rm\s+-[a-zA-Z]*f[a-zA-Z]*[rR][a-zA-Z]*\s+/tmp/",        # /tmp/... (-fr, -fR style)
-    r"rm\s+-[a-zA-Z]*[rR][a-zA-Z]*f[a-zA-Z]*\s+/var/tmp/",    # /var/tmp/... (-rf style)
-    r"rm\s+-[a-zA-Z]*f[a-zA-Z]*[rR][a-zA-Z]*\s+/var/tmp/",    # /var/tmp/... (-fr style)
-    r"rm\s+-[a-zA-Z]*[rR][a-zA-Z]*f[a-zA-Z]*\s+\$TMPDIR/",    # $TMPDIR/... (-rf style)
-    r"rm\s+-[a-zA-Z]*f[a-zA-Z]*[rR][a-zA-Z]*\s+\$TMPDIR/",    # $TMPDIR/... (-fr style)
-    r"rm\s+-[a-zA-Z]*[rR][a-zA-Z]*f[a-zA-Z]*\s+\$\{TMPDIR",   # ${TMPDIR}/... (-rf style)
-    r"rm\s+-[a-zA-Z]*f[a-zA-Z]*[rR][a-zA-Z]*\s+\$\{TMPDIR",   # ${TMPDIR}/... (-fr style)
-    r'rm\s+-[a-zA-Z]*[rR][a-zA-Z]*f[a-zA-Z]*\s+"\$TMPDIR/',   # "$TMPDIR/..." (-rf style)
-    r'rm\s+-[a-zA-Z]*f[a-zA-Z]*[rR][a-zA-Z]*\s+"\$TMPDIR/',   # "$TMPDIR/..." (-fr style)
-    r'rm\s+-[a-zA-Z]*[rR][a-zA-Z]*f[a-zA-Z]*\s+"\$\{TMPDIR',  # "${TMPDIR}/..." (-rf style)
-    r'rm\s+-[a-zA-Z]*f[a-zA-Z]*[rR][a-zA-Z]*\s+"\$\{TMPDIR',  # "${TMPDIR}/..." (-fr style)
-    # Also allow separate flags (-r -f) and long options on temp directories
-    r"rm\s+(-[a-zA-Z]+\s+)*-[rR]\s+(-[a-zA-Z]+\s+)*-f\s+/tmp/",      # rm -r -f /tmp/...
-    r"rm\s+(-[a-zA-Z]+\s+)*-f\s+(-[a-zA-Z]+\s+)*-[rR]\s+/tmp/",      # rm -f -r /tmp/...
-    r"rm\s+(-[a-zA-Z]+\s+)*-[rR]\s+(-[a-zA-Z]+\s+)*-f\s+/var/tmp/",  # rm -r -f /var/tmp/...
-    r"rm\s+(-[a-zA-Z]+\s+)*-f\s+(-[a-zA-Z]+\s+)*-[rR]\s+/var/tmp/",  # rm -f -r /var/tmp/...
-    r"rm\s+.*--recursive.*--force\s+/tmp/",   # rm --recursive --force /tmp/...
-    r"rm\s+.*--force.*--recursive\s+/tmp/",   # rm --force --recursive /tmp/...
-    r"rm\s+.*--recursive.*--force\s+/var/tmp/",
-    r"rm\s+.*--force.*--recursive\s+/var/tmp/",
+    # Allow rm -rf on temp directories
+    r"rm\s+-[a-z]*r[a-z]*f[a-z]*\s+/tmp/",
+    r"rm\s+-[a-z]*r[a-z]*f[a-z]*\s+/var/tmp/",
+    r"rm\s+-[a-z]*r[a-z]*f[a-z]*\s+\$TMPDIR/",
+    r"rm\s+-[a-z]*r[a-z]*f[a-z]*\s+\$\{TMPDIR",
+    r'rm\s+-[a-z]*r[a-z]*f[a-z]*\s+"\$TMPDIR/',
+    r'rm\s+-[a-z]*r[a-z]*f[a-z]*\s+"\$\{TMPDIR',
 ]
+
+
+def make_response(decision: str, reason: str, command: str) -> dict:
+    """Create the hook response JSON."""
+    if decision == "deny":
+        message = f"🚫 BLOCKED: {reason}\n\nRun this command manually if truly needed."
+    else:  # ask
+        message = f"⚠️  {reason}"
+
+    return {
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": decision,
+            "permissionDecisionReason": message
+        }
+    }
 
 
 def main():
     try:
         input_data = json.load(sys.stdin)
     except json.JSONDecodeError:
-        # Can't parse input, allow by default
         sys.exit(0)
 
     tool_name = input_data.get("tool_name", "")
-    # Use 'or {}' to handle both missing key AND explicit null value
-    tool_input = input_data.get("tool_input") or {}
+    tool_input = input_data.get("tool_input", {})
     command = tool_input.get("command", "")
 
-    # Only check Bash commands with valid string command
-    # Note: isinstance check prevents TypeError if command is int/list/bool
-    if tool_name != "Bash" or not isinstance(command, str) or not command:
+    # Only check Bash commands
+    if tool_name != "Bash" or not command:
         sys.exit(0)
 
-    # Check if command matches any safe pattern first
+    # Check safe patterns first (allowlist)
     for pattern in SAFE_PATTERNS:
-        if re.search(pattern, command):
+        if re.search(pattern, command, re.IGNORECASE):
             sys.exit(0)
 
-    # Check if command matches any destructive pattern
-    # Note: Case-sensitive matching is intentional - e.g., git branch -D vs -d are different!
-    for pattern, reason in DESTRUCTIVE_PATTERNS:
-        if re.search(pattern, command):
-            output = {
-                "hookSpecificOutput": {
-                    "hookEventName": "PreToolUse",
-                    "permissionDecision": "deny",
-                    "permissionDecisionReason": (
-                        f"BLOCKED by git_safety_guard.py\n\n"
-                        f"Reason: {reason}\n\n"
-                        f"Command: {command}\n\n"
-                        f"If this operation is truly needed, ask the user for explicit "
-                        f"permission and have them run the command manually."
-                    )
-                }
-            }
-            print(json.dumps(output))
+    # Check dangerous patterns (block completely)
+    for pattern, reason in DANGEROUS_PATTERNS:
+        if re.search(pattern, command, re.IGNORECASE):
+            print(json.dumps(make_response("deny", reason, command)))
+            sys.exit(0)
+
+    # Check risky patterns (prompt user)
+    for pattern, reason in RISKY_PATTERNS:
+        if re.search(pattern, command, re.IGNORECASE):
+            print(json.dumps(make_response("ask", reason, command)))
             sys.exit(0)
 
     # Allow all other commands
@@ -371,34 +299,24 @@ def main():
 
 if __name__ == "__main__":
     main()
-PYTHON_SCRIPT
+GUARD_SCRIPT
 
-# Make executable
 chmod +x "$INSTALL_DIR/hooks/git_safety_guard.py"
-echo -e "${GREEN}✓${NC} Created $INSTALL_DIR/hooks/git_safety_guard.py"
+echo -e "${GREEN}✓${NC} Created guard script"
 
-# Handle settings.json - merge if exists, create if not
+# Handle settings.json creation/merging
 SETTINGS_FILE="$INSTALL_DIR/settings.json"
 
+# Determine the correct hook path for the JSON
+if [[ "$INSTALL_TYPE" == "global" ]]; then
+    JSON_HOOK_PATH="\$HOME/.claude/hooks/git_safety_guard.py"
+else
+    JSON_HOOK_PATH="\$CLAUDE_PROJECT_DIR/.claude/hooks/git_safety_guard.py"
+fi
+
 if [[ -f "$SETTINGS_FILE" ]]; then
-    # Check if hooks.PreToolUse already exists
-    if python3 -c "import json; d=json.load(open('$SETTINGS_FILE')); exit(0 if 'hooks' in d and 'PreToolUse' in d['hooks'] else 1)" 2>/dev/null; then
-        echo -e "${YELLOW}⚠${NC}  $SETTINGS_FILE already has PreToolUse hooks configured."
-        echo -e "    Please manually add this to your existing PreToolUse array:"
-        echo ""
-        echo '    {'
-        echo '      "matcher": "Bash",'
-        echo '      "hooks": ['
-        echo '        {'
-        echo '          "type": "command",'
-        echo "          \"command\": \"$HOOK_PATH\""
-        echo '        }'
-        echo '      ]'
-        echo '    }'
-        echo ""
-    else
-        # Merge hooks into existing settings
-        python3 << MERGE_SCRIPT
+    # Merge into existing config using Python
+    python3 << MERGE_SCRIPT
 import json
 
 with open("$SETTINGS_FILE", "r") as f:
@@ -413,7 +331,7 @@ settings["hooks"]["PreToolUse"] = [
         "hooks": [
             {
                 "type": "command",
-                "command": "$HOOK_PATH"
+                "command": "$JSON_HOOK_PATH"
             }
         ]
     }
@@ -423,8 +341,7 @@ with open("$SETTINGS_FILE", "w") as f:
     json.dump(settings, f, indent=2)
     f.write("\n")
 MERGE_SCRIPT
-        echo -e "${GREEN}✓${NC} Updated $SETTINGS_FILE with hook configuration"
-    fi
+    echo -e "${GREEN}✓${NC} Updated existing settings.json"
 else
     # Create new settings.json
     cat > "$SETTINGS_FILE" << SETTINGS_JSON
@@ -436,7 +353,7 @@ else
         "hooks": [
           {
             "type": "command",
-            "command": "$HOOK_PATH"
+            "command": "$JSON_HOOK_PATH"
           }
         ]
       }
@@ -444,110 +361,211 @@ else
   }
 }
 SETTINGS_JSON
-    echo -e "${GREEN}✓${NC} Created $SETTINGS_FILE"
+    echo -e "${GREEN}✓${NC} Created settings.json"
 fi
 
-# Summary
 echo ""
-echo -e "${GREEN}════════════════════════════════════════════════════════════${NC}"
+echo -e "${GREEN}════════════════════════════════════════════════════${NC}"
 echo -e "${GREEN}Installation complete!${NC}"
-echo -e "${GREEN}════════════════════════════════════════════════════════════${NC}"
+echo -e "${GREEN}════════════════════════════════════════════════════${NC}"
 echo ""
-echo "The following destructive commands are now blocked:"
-echo "  • git checkout -- <files>"
-echo "  • git restore <files>"
-echo "  • git reset --hard"
-echo "  • git clean -f"
-echo "  • git push --force / -f"
-echo "  • git branch -D"
-echo "  • rm -rf (except /tmp, /var/tmp, \$TMPDIR)"
-echo "  • git stash drop/clear"
+echo -e "${RED}🚫 BLOCKED (dangerous):${NC}"
+echo "   • git restore <files>"
+echo "   • git reset --hard / --merge"
+echo "   • git clean -f"
+echo "   • git push --force main/master"
+echo "   • git stash clear"
+echo "   • rm -rf / or ~"
 echo ""
-echo -e "${YELLOW}⚠  IMPORTANT: Restart Claude Code for the hook to take effect.${NC}"
+echo -e "${YELLOW}⚠️  PROMPTS (risky):${NC}"
+echo "   • git checkout <files>"
+echo "   • git push --force (non-main branches)"
+echo "   • git branch -D"
+echo "   • rm -rf <dir>, rm <file>"
+echo "   • git stash drop"
+echo "   • File truncation (> file)"
+echo "   • mv -f overwrite"
+echo ""
+echo -e "${YELLOW}Restart Claude Code for the hook to take effect.${NC}"
 echo ""
 
 # Test the hook
 echo "Testing hook..."
-TEST_RESULT=$(echo '{"tool_name": "Bash", "tool_input": {"command": "git checkout -- test.txt"}}' | \
+TEST_RESULT=$(echo '{"tool_name": "Bash", "tool_input": {"command": "git reset --hard"}}' | \
     python3 "$INSTALL_DIR/hooks/git_safety_guard.py" 2>/dev/null || true)
 
 if echo "$TEST_RESULT" | grep -q "permissionDecision.*deny" 2>/dev/null; then
-    echo -e "${GREEN}✓${NC} Hook test passed - destructive commands will be blocked"
+    echo -e "${GREEN}✓${NC} Hook test passed (dangerous command blocked)"
 else
-    echo -e "${RED}✗${NC} Hook test failed - check Python installation"
+    echo -e "${RED}✗${NC} Hook test failed"
+    exit 1
+fi
+
+TEST_RESULT2=$(echo '{"tool_name": "Bash", "tool_input": {"command": "git checkout -- file.txt"}}' | \
+    python3 "$INSTALL_DIR/hooks/git_safety_guard.py" 2>/dev/null || true)
+
+if echo "$TEST_RESULT2" | grep -q "permissionDecision.*ask" 2>/dev/null; then
+    echo -e "${GREEN}✓${NC} Hook test passed (risky command prompts)"
+else
+    echo -e "${RED}✗${NC} Hook test failed"
     exit 1
 fi
 ```
 
-### Quick One-Liner Installation
+### Manual Installation
 
-For project-local installation (current directory):
+1. Create the hooks directory:
+   ```bash
+   mkdir -p .claude/hooks
+   ```
 
-```bash
-curl -fsSL https://gist.githubusercontent.com/YOUR_USERNAME/GIST_ID/raw/install-claude-git-guard.sh | bash
-```
+2. Copy the Python guard script to `.claude/hooks/git_safety_guard.py`
 
-For global installation:
+3. Make it executable:
+   ```bash
+   chmod +x .claude/hooks/git_safety_guard.py
+   ```
 
-```bash
-curl -fsSL https://gist.githubusercontent.com/YOUR_USERNAME/GIST_ID/raw/install-claude-git-guard.sh | bash -s -- --global
-```
+4. Create or update `.claude/settings.json`:
+   ```json
+   {
+     "hooks": {
+       "PreToolUse": [
+         {
+           "matcher": "Bash",
+           "hooks": [
+             {
+               "type": "command",
+               "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/git_safety_guard.py"
+             }
+           ]
+         }
+       ]
+     }
+   }
+   ```
 
-*(Replace with actual gist URL if you publish this script)*
-
-## Manual Installation
-
-If you prefer not to use the script:
-
-1. Create `.claude/hooks/` directory in your project (or `~/.claude/hooks/` for global)
-2. Copy `git_safety_guard.py` into it
-3. Make it executable: `chmod +x .claude/hooks/git_safety_guard.py`
-4. Create `.claude/settings.json` with the hook configuration (see Configuration section above)
 5. Restart Claude Code
 
-## Adding More Blocked Commands
+## Configuration
 
-Edit `git_safety_guard.py` and add patterns to `DESTRUCTIVE_PATTERNS`:
+### Project-Level (Recommended)
 
-```python
-DESTRUCTIVE_PATTERNS = [
-    # ... existing patterns ...
-    (
-        r"your-regex-pattern",
-        "Explanation of why this is dangerous"
-    ),
-]
-```
+Place files in your project's `.claude/` directory. The hook applies only to that project.
 
-If a pattern has safe variants, add them to `SAFE_PATTERNS`:
+### Global Installation
 
-```python
-SAFE_PATTERNS = [
-    # ... existing patterns ...
-    r"pattern-that-looks-dangerous-but-is-safe",
-]
-```
+Use `--global` flag or place files in `~/.claude/`. The hook applies to all projects.
 
-## The Incident That Prompted This
-
-```
-User: OMG you erased uncommitted changes from the other agent?!?!?!??!? HOURS OF WORK!!!
-User: YOU ARE EXPRESSLY FORBIDDEN FROM DOING THIS IN AGENTS.md
-```
-
-The agent had run:
 ```bash
-git checkout -- .ubsignore ubs modules/helpers/resource_lifecycle_py.py \
-  modules/helpers/type_narrowing_rust.py modules/ubs-swift.sh
+./install-claude-git-guard.sh --global
 ```
 
-This silently replaced all those files with their last committed versions, erasing hours of work from a parallel Codex session. The work was recovered via `git fsck --lost-found` which found a dangling tree object from Codex's snapshot, but it was a close call.
+## How It Works
 
-**Instructions alone don't prevent accidents. Mechanical enforcement does.**
+The Python script receives JSON via stdin containing the command about to execute:
 
----
+```json
+{
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "git checkout -- file.txt"
+  }
+}
+```
 
-*Created: December 17, 2025*
-*Updated: January 3, 2026 - Fixed null input crash, non-string command crash, added rm -r -f separate flags and --recursive --force long options patterns, case sensitivity fixes, rm -Rf/-fR handling*
-*Project: Ultimate Bug Scanner*
-*Related: AGENTS.md, .claude/hooks/git_safety_guard.py*
+The guard then:
+1. Checks against **safe patterns** first (allowlist)
+2. Checks against **dangerous patterns** → returns `"permissionDecision": "deny"`
+3. Checks against **risky patterns** → returns `"permissionDecision": "ask"`
+4. If no match, exits silently (allows command)
+
+### Permission Decisions
+
+| Decision | Behavior | User Experience |
+|----------|----------|-----------------|
+| `deny` | Blocked completely | Shows 🚫 BLOCKED message, command not run |
+| `ask` | Prompts user | Shows ⚠️ warning, user chooses Yes/No |
+| (none) | Allowed | Command runs normally |
+
+## Testing
+
+```bash
+# Should be BLOCKED (deny)
+echo '{"tool_name": "Bash", "tool_input": {"command": "git reset --hard"}}' | \
+    python3 .claude/hooks/git_safety_guard.py
+
+# Should PROMPT (ask)
+echo '{"tool_name": "Bash", "tool_input": {"command": "git checkout -- file.txt"}}' | \
+    python3 .claude/hooks/git_safety_guard.py
+
+# Should be ALLOWED (no output)
+echo '{"tool_name": "Bash", "tool_input": {"command": "git status"}}' | \
+    python3 .claude/hooks/git_safety_guard.py
+
+# rm -rf on temp should be ALLOWED
+echo '{"tool_name": "Bash", "tool_input": {"command": "rm -rf /tmp/test-dir"}}' | \
+    python3 .claude/hooks/git_safety_guard.py
+```
+
+## Customization
+
+### Adding New Patterns
+
+Edit the Python script to add patterns to the appropriate list:
+
+```python
+# Block completely
+DANGEROUS_PATTERNS = [
+    (r"your-regex-here", "Explanation shown when blocked."),
+    ...
+]
+
+# Prompt user
+RISKY_PATTERNS = [
+    (r"your-regex-here", "Question shown to user. Continue?"),
+    ...
+]
+
+# Always allow (checked first)
+SAFE_PATTERNS = [
+    r"safe-pattern-regex",
+    ...
+]
+```
+
+### Adjusting File Extensions
+
+The default patterns protect common source files:
+- `rs`, `ts`, `js`, `vue`, `py`, `lua`, `json`, `toml`, `md`, `txt`, `yaml`, `yml`, `sh`, `css`, `html`
+
+Add more extensions to the regex patterns as needed.
+
+## Important Notes
+
+**Restart Required**: Claude Code snapshots hook configuration at startup. Changes require application restart.
+
+**Works with Bypass Mode**: The `ask` permission decision prompts the user even when running in bypass permissions mode.
+
+**Not Foolproof**: Pattern matching via regex can be bypassed with obfuscation. This is a safety net for honest mistakes, not a security boundary.
+
+**Chained Commands**: The hook catches patterns in chained commands like `touch file && rm file`.
+
+**Commit Messages**: Be aware that patterns can match text inside commit messages (e.g., mentioning "rm -rf" in a commit message may trigger a prompt).
+
+## Troubleshooting
+
+### Hook not working
+
+1. Verify the script is executable: `chmod +x .claude/hooks/git_safety_guard.py`
+2. Check settings.json syntax is valid JSON
+3. Restart Claude Code completely
+4. Test the hook manually with the echo commands above
+
+### False positives
+
+If legitimate commands are being blocked/prompted, add them to `SAFE_PATTERNS` in the Python script.
+
+### Hook timeout
+
+The default hook timeout is 60 seconds. The guard script runs in milliseconds, so timeouts indicate a different issue (check script syntax).
